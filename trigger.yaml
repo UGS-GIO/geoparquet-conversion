@@ -1,0 +1,46 @@
+# Alternative: Create Eventarc trigger via YAML configuration
+# Use this if you prefer declarative configuration
+
+apiVersion: eventarc.cloud.google.com/v1
+kind: Trigger
+metadata:
+  name: geoparquet-storage-trigger
+  namespace: your-project-id
+  labels:
+    purpose: geoparquet-conversion
+spec:
+  eventFilters:
+    - attribute: type
+      value: google.cloud.storage.object.v1.finalized
+    - attribute: bucket
+      value: your-source-bucket
+  destination:
+    cloudRunService:
+      service: geoparquet-converter
+      region: us-central1
+      path: /convert
+  serviceAccount: your-project-id@appspot.gserviceaccount.com
+
+---
+# You can also filter by specific file patterns
+apiVersion: eventarc.cloud.google.com/v1
+kind: Trigger
+metadata:
+  name: geoparquet-zip-only-trigger
+  namespace: your-project-id
+spec:
+  eventFilters:
+    - attribute: type
+      value: google.cloud.storage.object.v1.finalized
+    - attribute: bucket
+      value: your-source-bucket
+    # Only trigger for zip files
+    - attribute: objectId
+      value: "*.zip"
+      operator: match
+  destination:
+    cloudRunService:
+      service: geoparquet-converter
+      region: us-central1
+      path: /convert
+  serviceAccount: your-project-id@appspot.gserviceaccount.com
