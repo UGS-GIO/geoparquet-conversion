@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # Configuration
-PROJECT_ID="your-project-id"
+PROJECT_ID="ut-dnr-ugs-backend-tools"
 SERVICE_NAME="geoparquet-converter"
 REGION="us-central1"
 IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
 OUTPUT_BUCKET="stagedparquet"
-SOURCE_BUCKET="your-source-bucket"
+SOURCE_BUCKET="stagedzips"
 TRIGGER_NAME="geoparquet-storage-trigger"
 
 echo "🚀 Deploying GeoParquet Converter to Cloud Run with Eventarc..."
