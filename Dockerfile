@@ -1,9 +1,11 @@
-# Use official GDAL image as base (includes GDAL with GeoParquet support)
-FROM ghcr.io/osgeo/gdal:ubuntu-small-3.8.0
+# Use official GDAL image with full drivers (includes GeoParquet support)
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.8.0
 
-# Install Node.js 18
+# Install Node.js and additional dependencies for Parquet support
 RUN apt-get update && apt-get install -y \
     curl \
+    libarrow-dev \
+    libparquet-dev \
     && curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
     && apt-get install -y nodejs \
     && apt-get clean \

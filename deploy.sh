@@ -20,11 +20,8 @@ gcloud services enable run.googleapis.com \
   --project ${PROJECT_ID}
 
 # Build and push Docker image
-echo "📦 Building Docker image..."
-docker build -t ${IMAGE_NAME} .
-
-echo "⬆️  Pushing to Google Container Registry..."
-docker push ${IMAGE_NAME}
+echo "📦 Building with Cloud Build..."
+gcloud builds submit --tag ${IMAGE_NAME} .
 
 # Deploy to Cloud Run
 echo "🚀 Deploying to Cloud Run..."

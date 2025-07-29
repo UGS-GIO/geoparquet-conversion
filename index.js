@@ -40,28 +40,53 @@ app.post('/convert', async (req, res) => {
   const startTime = Date.now();
   
   try {
-    // Handle Eventarc CloudEvent format (same as your original Cloud Function)
-    const cloudEvent = req.body;
-    console.log('🐛 CloudEvent received:', JSON.stringify(cloudEvent, null, 2));
+    // Handle different event formats
+    const event = req.body;
+    console.log('🐛 Event received:', JSON.stringify(event, null, 2));
     
-    // Extract event data (same structure as your original function)
-    const eventData = cloudEvent.data || {};
+    // Check if it's a Cloud Storage notification (direct) or CloudEvent format
+    let eventData;
+    if (event.kind === 'storage#object') {
+      // Direct Cloud Storage notification format
+      eventData = event;
+      console.log('📦 Processing direct Cloud Storage notification');
+    } else if (event.data) {
+      // CloudEvent format
+      eventData = event.data;
+      console.log('⚡ Processing CloudEvent format');
+    } else {
+      // Manual format or other
+      eventData = event;
+      console.log('🔧 Processing manual/other format');
+    }
 
-    console.log('🐛 Event data received:', JSON.stringify(eventData, null, 2));
+    console.log('🐛 Event data processed:', JSON.stringify(eventData, null, 2));
     
-    const bucketName = eventData.bucket || cloudEvent.source?.split('/buckets/')[1]?.split('/')[0];
+    const bucketName = eventData.bucket;
     const fileName = eventData.name;
-    const fileSize = eventData.size || 0;
+    const fileSize = parseInt(eventData.size) || 0;
 
     console.log(`🚀 Starting conversion: ${fileName || 'undefined'} (${fileSize || 'undefined'} bytes)`);
-    console.log(`Event ID: ${cloudEvent.id || 'undefined'}`);
-    console.log(`Event Type: ${cloudEvent.type || 'undefined'}`);
+    console.log(`Event ID: ${event.id || 'undefined'}`);
+    console.log(`Event Type: ${event.eventType || event.type || 'undefined'}`);
     console.log(`Bucket: ${bucketName || 'undefined'}`);
 
     // Basic validation
     if (!fileName || !fileName.toLowerCase().endsWith('.zip')) {
       console.log(`⏭️  File ${fileName} is not a zip file. Skipping.`);
       return res.status(200).json({ message: 'File is not a zip file, skipping', fileName });
+    }
+
+    // Check if output file already exists to avoid reprocessing
+    const outputFileName = `${path.basename(fileName, '.zip')}.parquet`;
+    try {
+      const [exists] = await storage.bucket(outputBucketName).file(outputFileName).exists();
+      if (exists) {
+        console.log(`✅ Output file ${outputFileName} already exists. Skipping reprocessing.`);
+        return res.status(200).json({ message: 'File already processed', fileName, outputFileName });
+      }
+    } catch (err) {
+      console.log(`ℹ️  Could not check if output exists: ${err.message}`);
     }
 
     // File size check
@@ -167,6 +192,7 @@ async function processFile(bucketName, fileName, fileSize, startTime) {
       formatOptions = [
         '-f', 'Parquet',
         '-makevalid',
+        '-skipfailures',
         '-lco', 'COMPRESSION=SNAPPY',
         '-lco', 'EDGES=PLANAR',
         '-lco', 'GEOMETRY_ENCODING=WKB',
@@ -179,7 +205,8 @@ async function processFile(bucketName, fileName, fileSize, startTime) {
       outputExtension = '.geojson';
       formatOptions = [
         '-f', 'GeoJSON',
-        '-makevalid'
+        '-makevalid',
+        '-skipfailures'
       ];
     }
     
@@ -195,8 +222,11 @@ async function processFile(bucketName, fileName, fileSize, startTime) {
       const util = require('util');
       const execAsync = util.promisify(exec);
       
+      // Set the correct output path for Parquet
+      const parquetOutputPath = path.join(tempDir, `${Date.now()}_${path.basename(fileName, '.zip')}.parquet`);
+      
       // First try Parquet with system ogr2ogr
-      const ogr2ogrCmd = `ogr2ogr -f Parquet "${tempOutputPath.replace('.geojson', '.parquet')}" "${gdalInputPath}" --config OGR_PARQUET_ALLOW_ALL_DIMS YES -makevalid -lco COMPRESSION=SNAPPY -lco EDGES=PLANAR -lco GEOMETRY_ENCODING=WKB -lco GEOMETRY_NAME=geometry -lco ROW_GROUP_SIZE=65536`;
+      const ogr2ogrCmd = `ogr2ogr -f Parquet "${parquetOutputPath}" "${gdalInputPath}" --config OGR_PARQUET_ALLOW_ALL_DIMS YES -makevalid -skipfailures -lco COMPRESSION=SNAPPY -lco EDGES=PLANAR -lco GEOMETRY_ENCODING=WKB -lco GEOMETRY_NAME=geometry -lco ROW_GROUP_SIZE=65536`;
       
       console.log(`🔧 Running: ${ogr2ogrCmd}`);
       await execAsync(ogr2ogrCmd);
@@ -205,9 +235,10 @@ async function processFile(bucketName, fileName, fileSize, startTime) {
       outputFormat = 'Parquet';
       outputExtension = '.parquet';
       outputFileName = `${path.basename(fileName, '.zip')}.parquet`;
-      tempOutputPath = path.join(tempDir, `${Date.now()}_${outputFileName}`);
+      tempOutputPath = parquetOutputPath;
       
       console.log(`✅ System ogr2ogr successful - Parquet format used`);
+      console.log(`📁 Output file path: ${tempOutputPath}`);
       
     } catch (ogrError) {
       console.log(`⚠️  System ogr2ogr failed: ${ogrError.message}`);
