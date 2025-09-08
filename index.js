@@ -62,6 +62,33 @@ app.post('/convert', async (req, res) => {
     const fileName = eventData.name;
     const fileSize = parseInt(eventData.size) || 0;
 
+    if (fileName && fileName.startsWith('temp')) {
+      console.log(`Ignoring temp file: ${fileName}`);
+      return res.status(200).json({ message: 'Temp file ignored', fileName });
+    }
+
+    // CHECK IF FILE EXISTS - This stops the retry loop
+    try {
+      const [exists] = await storage.bucket(bucketName).file(fileName).exists();
+      if (!exists) {
+        console.log(`File ${fileName} does not exist in bucket ${bucketName}, acknowledging event to stop retries`);
+        return res.status(200).json({ 
+          message: 'File not found, event acknowledged to stop retries', 
+          fileName,
+          bucketName 
+        });
+      }
+      console.log(`✅ File ${fileName} exists in bucket ${bucketName}`);
+    } catch (checkError) {
+      console.log(`Cannot verify file existence: ${checkError.message}, acknowledging anyway to stop retries`);
+      return res.status(200).json({ 
+        message: 'File check failed, event acknowledged to stop retries', 
+        error: checkError.message,
+        fileName,
+        bucketName
+      });
+    }
+
     console.log(`🚀 Starting conversion: ${fileName || 'undefined'} (${fileSize || 'undefined'} bytes)`);
 
     if (!fileName || !fileName.toLowerCase().endsWith('.zip')) {
@@ -93,8 +120,9 @@ app.post('/convert', async (req, res) => {
       stack: error.stack
     });
     
-    res.status(500).json({
-      error: 'Conversion failed',
+    // Return 200 instead of 500 to stop retry loops
+    res.status(200).json({
+      error: 'Conversion failed but acknowledged to stop retries',
       message: error.message,
       processingTime
     });
@@ -125,156 +153,261 @@ app.post('/convert-manual', async (req, res) => {
 
 async function processFile(bucketName, fileName, fileSize, startTime) {
   const tempDir = os.tmpdir();
-  const localZipPath = path.join(tempDir, `${Date.now()}_${path.basename(fileName)}`);
-  const processedFiles = [];
-  const tempFiles = [localZipPath];
+  const localZipPath = path.join(tempDir, `${Date.now()}_${fileName}`);
+  
+  // Declare all variables at function level to avoid temporal dead zone
+  let gdalInputPath = null;
+  let tempExtractDir = null;
+  let outputFileName, metadataFileName, tempOutputPath, tempMetadataPath;
 
   try {
+    // 1. Download the zip file
     console.log(`⬇️  Downloading ${fileName}...`);
     await storage.bucket(bucketName).file(fileName).download({ destination: localZipPath });
     console.log(`✅ Download complete`);
 
+    // 2. Extract metadata.json from zip FIRST
+    console.log(`📋 Looking for metadata.json...`);
+    let metadata = null;
+    try {
+      metadata = await extractMetadataFromZip(localZipPath);
+      console.log('📝 Found metadata.json:', Object.keys(metadata));
+    } catch (error) {
+      console.log('⚠️  No metadata.json found or failed to parse:', error.message);
+    }
+
+    // 3. Find source data in zip
     console.log(`🔍 Inspecting zip file contents...`);
-    const sources = await findSourcesInZip(localZipPath);
-    if (sources.length === 0) {
-      throw new Error('No convertible data sources (GDB, Shapefile, CSV) found in zip file');
+    const sourceDataPathInZip = await findSourceInZip(localZipPath);
+    if (!sourceDataPathInZip) {
+      throw new Error('No convertible data source found in zip file');
+    }
+
+    console.log(`📂 Found source data: ${sourceDataPathInZip}`);
+    
+    // 4. Generate output filenames based on source layer
+    const baseFileName = path.basename(fileName, '.zip');
+    const layerName = path.basename(sourceDataPathInZip, path.extname(sourceDataPathInZip));
+    
+    outputFileName = `${baseFileName}_${layerName}.parquet`;
+    metadataFileName = `${baseFileName}_${layerName}.metadata.json`;
+    
+    tempOutputPath = path.join(tempDir, `${Date.now()}_${outputFileName}`);
+    tempMetadataPath = path.join(tempDir, `${Date.now()}_${metadataFileName}`);
+    
+    console.log(`📁 Output files will be: ${outputFileName} and ${metadataFileName}`);
+    
+    // 5. Extract shapefile if it's a shapefile  
+    if (sourceDataPathInZip.toLowerCase().endsWith('.shp')) {
+      console.log(`🗂️  Extracting shapefile from zip...`);
+      tempExtractDir = path.join(tempDir, `extracted_${Date.now()}`);
+      await fs.mkdir(tempExtractDir, { recursive: true });
+      
+      const extractedShpPath = await extractShapefileFromZip(localZipPath, sourceDataPathInZip, tempExtractDir);
+      gdalInputPath = extractedShpPath;
+      console.log(`📂 Using extracted shapefile: ${gdalInputPath}`);
+    } else {
+      // For GDB or CSV, use vsizip path
+      gdalInputPath = `/vsizip/${localZipPath}/${sourceDataPathInZip}`;
+      console.log(`📂 Using vsizip path: ${gdalInputPath}`);
     }
     
-    console.log(`📂 Found ${sources.length} potential source(s) to process.`);
+    // 6. Convert to parquet WITHOUT embedded metadata
+    console.log(`🔄 Converting with system ogr2ogr...`);
+    
+    const { exec } = require('child_process');
+    const util = require('util');
+    const execAsync = util.promisify(exec);
+    
+    // Simple ogr2ogr command without metadata injection
+    const ogr2ogrCmd = `ogr2ogr -f Parquet "${tempOutputPath}" "${gdalInputPath}" --config OGR_PARQUET_ALLOW_ALL_DIMS YES --config SHAPE_RESTORE_SHX YES -makevalid -skipfailures -lco COMPRESSION=SNAPPY -lco EDGES=PLANAR -lco GEOMETRY_ENCODING=WKB -lco GEOMETRY_NAME=geometry -lco ROW_GROUP_SIZE=65536`;
+    
+    console.log(`🔧 Running: ${ogr2ogrCmd}`);
+    await execAsync(ogr2ogrCmd);
+    
+    console.log(`✅ System ogr2ogr successful - Parquet format created`);
+    
+    // 7. Write metadata to separate file if it exists
+    if (metadata) {
+      console.log(`📝 Writing metadata to separate file: ${metadataFileName}`);
+      await fs.writeFile(tempMetadataPath, JSON.stringify(metadata, null, 2));
+    }
+    
+    // 8. Get output file stats
+    const stats = await fs.stat(tempOutputPath);
+    console.log(`💾 Parquet file created successfully: ${stats.size} bytes`);
 
-    for (const source of sources) {
-      const { sourcePath, type } = source;
-      const gdalInputPath = `/vsizip/${localZipPath}/${sourcePath}`;
-      console.log(`Processing source: ${gdalInputPath} (Type: ${type})`);
-
-      if (type === 'GDB') {
-        const featureClasses = await getFeatureClasses(gdalInputPath);
-        console.log(`🗃️  Found ${featureClasses.length} feature classes in GDB: ${featureClasses.join(', ')}`);
-        if (featureClasses.length === 0) continue;
-
-        for (const featureClass of featureClasses) {
-          const outputFileName = `${path.basename(fileName, '.zip')}_${featureClass}.parquet`;
-          const result = await processDataSource(gdalInputPath, outputFileName, { featureClass });
-          processedFiles.push(result);
-        }
-      } else { // Handle Shapefile and CSV
-        const baseOutputName = path.basename(sourcePath, path.extname(sourcePath));
-        const outputFileName = `${path.basename(fileName, '.zip')}_${baseOutputName}.parquet`;
-        const result = await processDataSource(gdalInputPath, outputFileName);
-        processedFiles.push(result);
-      }
+    // 9. Upload parquet file
+    console.log(`⬆️  Uploading ${outputFileName} to bucket ${outputBucketName}...`);
+    await storage.bucket(outputBucketName).upload(tempOutputPath, {
+      destination: outputFileName,
+    });
+    
+    // 10. Upload metadata file if it exists
+    if (metadata) {
+      console.log(`⬆️  Uploading ${metadataFileName} to bucket ${outputBucketName}...`);
+      await storage.bucket(outputBucketName).upload(tempMetadataPath, {
+        destination: metadataFileName,
+      });
     }
     
     const processingTime = Date.now() - startTime;
-    console.log(`✅ Conversion task completed in ${processingTime}ms`);
-    
-    const successfulFiles = processedFiles.filter(f => f.status === 'success');
-    const totalOutputSize = successfulFiles.reduce((sum, f) => sum + (f.outputSize || 0), 0);
-    
+    console.log(`✅ Conversion completed successfully in ${processingTime}ms`);
+
     return {
       success: true,
       inputFile: fileName,
-      outputFiles: processedFiles,
+      outputFile: outputFileName,
+      metadataFile: metadata ? metadataFileName : null,
       inputSize: fileSize,
-      totalOutputSize,
+      outputSize: stats.size,
+      format: 'Parquet',
       processingTime,
       bucket: outputBucketName,
-      summary: {
-        total: processedFiles.length,
-        successful: successfulFiles.length,
-        skipped: processedFiles.filter(f => f.status === 'skipped').length,
-        failed: processedFiles.filter(f => f.status === 'failed').length
-      }
+      hasMetadata: !!metadata
     };
 
   } finally {
+    // Cleanup
     console.log(`🧹 Cleaning up temporary files...`);
-    for (const tempFile of tempFiles) {
-      await fs.unlink(tempFile).catch(err => 
-        console.error(`Failed to delete temp file ${tempFile}: ${err.message}`)
+    await fs.unlink(localZipPath).catch(err => 
+      console.error(`Failed to delete temp zip: ${err.message}`)
+    );
+    if (tempOutputPath) {
+      await fs.unlink(tempOutputPath).catch(err => 
+        console.error(`Failed to delete temp output: ${err.message}`)
+      );
+    }
+    if (tempMetadataPath) {
+      await fs.unlink(tempMetadataPath).catch(err => 
+        console.error(`Failed to delete temp metadata: ${err.message}`)
+      );
+    }
+    // Clean up extracted shapefile directory
+    if (tempExtractDir) {
+      await fs.rmdir(tempExtractDir, { recursive: true }).catch(err =>
+        console.error(`Failed to delete temp extract dir: ${err.message}`)
       );
     }
     console.log(`🏁 Cleanup complete`);
   }
 }
 
-async function processDataSource(gdalInputPath, outputFileName, options = {}) {
-  const tempDir = os.tmpdir();
-  const tempOutputPath = path.join(tempDir, `${Date.now()}_${outputFileName}`);
+// Add this new function to extract metadata from zip
+async function extractMetadataFromZip(zipPath) {
+  return new Promise((resolve, reject) => {
+    yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+      if (err) return reject(err);
+      
+      zipfile.readEntry();
+      zipfile.on('entry', (entry) => {
+        if (entry.fileName.toLowerCase().includes('metadata.json')) {
+          zipfile.openReadStream(entry, (err, readStream) => {
+            if (err) return reject(err);
+            
+            let content = '';
+            readStream.on('data', chunk => content += chunk);
+            readStream.on('end', () => {
+              try {
+                resolve(JSON.parse(content));
+              } catch (parseErr) {
+                reject(parseErr);
+              }
+            });
+            readStream.on('error', reject);
+          });
+        } else {
+          zipfile.readEntry();
+        }
+      });
+      
+      zipfile.on('end', () => reject(new Error('metadata.json not found')));
+    });
+  });
+}
+
+/**
+ * Extract shapefile and all its components from zip
+ */
+async function extractShapefileFromZip(zipPath, shapefilePath, extractDir) {
+  const shapefileBaseName = path.basename(shapefilePath, path.extname(shapefilePath));
   
-  try {
-    const [exists] = await storage.bucket(outputBucketName).file(outputFileName).exists();
-    if (exists) {
-      console.log(`✅ Output file ${outputFileName} already exists. Skipping.`);
-      return {
-        source: options.featureClass || gdalInputPath,
-        outputFile: outputFileName,
-        status: 'skipped',
-        reason: 'already exists'
-      };
-    }
-
-    await convertToParquet(gdalInputPath, tempOutputPath, options.featureClass);
-    
-    const stats = await fs.stat(tempOutputPath);
-    console.log(`💾 Parquet file created: ${stats.size} bytes`);
-
-    console.log(`⬆️  Uploading ${outputFileName} to bucket ${outputBucketName}...`);
-    await storage.bucket(outputBucketName).upload(tempOutputPath, { destination: outputFileName });
-    
-    return {
-      source: options.featureClass || path.basename(gdalInputPath),
-      outputFile: outputFileName,
-      outputSize: stats.size,
-      status: 'success'
-    };
-  } catch (error) {
-    console.error(`❌ Failed to process data source ${gdalInputPath}: ${error.message}`);
-    return {
-      source: options.featureClass || gdalInputPath,
-      outputFile: outputFileName,
-      status: 'failed',
-      error: error.message
-    };
-  } finally {
-    await fs.unlink(tempOutputPath).catch(() => {}); // Clean up the specific output file
-  }
+  return new Promise((resolve, reject) => {
+    yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+      if (err) return reject(err);
+      
+      const filesToExtract = [];
+      
+      zipfile.readEntry();
+      zipfile.on('entry', (entry) => {
+        const entryBaseName = path.basename(entry.fileName, path.extname(entry.fileName));
+        
+        // Check if this file belongs to the same shapefile (same base name)
+        if (entryBaseName === shapefileBaseName) {
+          filesToExtract.push(entry);
+        }
+        zipfile.readEntry();
+      });
+      
+      zipfile.on('end', async () => {
+        console.log(`📦 Found ${filesToExtract.length} shapefile components to extract`);
+        
+        try {
+          // Extract each component
+          for (const entry of filesToExtract) {
+            await extractSingleFile(zipPath, entry.fileName, extractDir);
+            console.log(`✅ Extracted: ${entry.fileName}`);
+          }
+          resolve(path.join(extractDir, path.basename(shapefilePath)));
+        } catch (extractError) {
+          reject(extractError);
+        }
+      });
+      
+      zipfile.on('error', reject);
+    });
+  });
 }
 
-async function convertToParquet(gdalInputPath, outputPath, layerName = null) {
-    const { exec } = require('child_process');
-    const util = require('util');
-    const execAsync = util.promisify(exec);
-
-    const layerArg = layerName ? `"${layerName}"` : '';
-    const ogr2ogrCmd = `ogr2ogr -f Parquet "${outputPath}" "${gdalInputPath}" ${layerArg} --config OGR_PARQUET_ALLOW_ALL_DIMS YES -makevalid -skipfailures -lco COMPRESSION=SNAPPY -lco EDGES=PLANAR -lco GEOMETRY_ENCODING=WKB -lco GEOMETRY_NAME=geometry -lco ROW_GROUP_SIZE=65536`;
-    
-    console.log(`🔧 Running system ogr2ogr: ${ogr2ogrCmd}`);
-    try {
-        await execAsync(ogr2ogrCmd);
-        console.log(`✅ System ogr2ogr successful for ${gdalInputPath}`);
-    } catch (error) {
-        console.error(`⚠️  System ogr2ogr failed for ${gdalInputPath}: ${error.message}`);
-        throw error; // Re-throw the error to be caught by the calling function
-    }
+/**
+ * Extract a single file from zip
+ */
+function extractSingleFile(zipPath, fileName, extractDir) {
+  return new Promise((resolve, reject) => {
+    yauzl.open(zipPath, { lazyEntries: true }, (err, zipfile) => {
+      if (err) return reject(err);
+      
+      zipfile.readEntry();
+      zipfile.on('entry', (entry) => {
+        if (entry.fileName === fileName) {
+          zipfile.openReadStream(entry, (err, readStream) => {
+            if (err) return reject(err);
+            
+            const outputPath = path.join(extractDir, path.basename(fileName));
+            const writeStream = require('fs').createWriteStream(outputPath);
+            
+            readStream.pipe(writeStream);
+            writeStream.on('finish', () => resolve(outputPath));
+            writeStream.on('error', reject);
+            readStream.on('error', reject);
+          });
+        } else {
+          zipfile.readEntry();
+        }
+      });
+      
+      zipfile.on('end', () => reject(new Error(`File ${fileName} not found in zip`)));
+      zipfile.on('error', reject);
+    });
+  });
 }
 
-async function getFeatureClasses(gdalInputPath) {
-  try {
-    const dataset = await gdal.openAsync(gdalInputPath);
-    const featureClasses = [];
-    for (let i = 0; i < dataset.layers.count(); i++) {
-      featureClasses.push(dataset.layers.get(i).name);
-    }
-    dataset.close();
-    return featureClasses;
-  } catch (error) {
-    console.error(`Failed to get feature classes from ${gdalInputPath}: ${error.message}`);
-    throw error;
-  }
-}
-
-function findSourcesInZip(zipPath) {
+/**
+ * Inspects a zip file and finds the first GDB, SHP, or CSV.
+ * @param {string} zipPath Path to the local zip file.
+ * @returns {Promise<string|null>} The path of the data source within the zip, or null.
+ */
+function findSourceInZip(zipPath) {
   return new Promise((resolve, reject) => {
     const sources = [];
     const foundGDBs = new Set();
