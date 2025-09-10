@@ -456,7 +456,14 @@ function findSourceInZip(zipPath) {
       
       zipfile.on('end', () => {
         console.log(`🔍 Zip inspection complete. Found ${sources.length} sources.`);
-        resolve(sources);
+        
+        // Return the first source's path, or null if none found
+        if (sources.length > 0) {
+          console.log(`🎯 Selected source: ${sources[0].sourcePath}`);
+          resolve(sources[0].sourcePath);  // Return the SOURCE PATH STRING, not the object
+        } else {
+          resolve(null);
+        }
       });
       
       zipfile.on('error', reject);
