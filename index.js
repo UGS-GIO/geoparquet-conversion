@@ -22,6 +22,16 @@ if (!outputBucketName) {
   throw new Error('OUTPUT_BUCKET environment variable is required');
 }
 
+// Helper function to sanitize filenames
+function sanitizeFileName(fileName) {
+  return fileName
+    .replace(/\s+/g, '_')           // Replace spaces with underscores
+    .replace(/[^a-zA-Z0-9_-]/g, '') // Remove special characters except underscore and dash
+    .replace(/_+/g, '_')            // Replace multiple underscores with single
+    .replace(/^_|_$/g, '')          // Remove leading/trailing underscores
+    .toLowerCase();                 // Convert to lowercase for consistency
+}
+
 // Middleware
 app.use(express.json());
 
@@ -185,9 +195,9 @@ async function processFile(bucketName, fileName, fileSize, startTime) {
 
     console.log(`📂 Found source data: ${sourceDataPathInZip}`);
     
-    // 4. Generate output filenames based on source layer
-    const baseFileName = path.basename(fileName, '.zip');
-    const layerName = path.basename(sourceDataPathInZip, path.extname(sourceDataPathInZip));
+    // 4. Generate output filenames based on source layer WITH SANITIZATION
+    const baseFileName = sanitizeFileName(path.basename(fileName, '.zip'));
+    const layerName = sanitizeFileName(path.basename(sourceDataPathInZip, path.extname(sourceDataPathInZip)));
     
     outputFileName = `${baseFileName}_${layerName}.parquet`;
     metadataFileName = `${baseFileName}_${layerName}.metadata.json`;
